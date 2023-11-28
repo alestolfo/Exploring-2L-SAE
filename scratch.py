@@ -1,6 +1,6 @@
 # %%
 import os
-os.environ["TRANSFORMERS_CACHE"] = "/workspace/cache/"
+#os.environ["TRANSFORMERS_CACHE"] = "/workspace/cache/"
 # %%
 from neel.imports import *
 from neel_plotly import *
@@ -39,7 +39,6 @@ import tqdm.notebook as tqdm
 import plotly.express as px
 import pandas as pd
 
-# %%
 # %%
 DTYPES = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
 SAVE_DIR = Path("/workspace/1L-Sparse-Autoencoder/checkpoints")
@@ -124,8 +123,8 @@ class AutoEncoder(nn.Module):
         self = cls(cfg=cfg)
         self.load_state_dict(utils.download_file_from_hf("NeelNanda/sparse_autoencoder", f"{version}.pt", force_is_torch=True))
         return self
-encoder0 = AutoEncoder.load_from_hf("gelu-2l_L0_16384_mlp_out_51", "cuda")
-encoder1 = AutoEncoder.load_from_hf("gelu-2l_L1_16384_mlp_out_50", "cuda")
+encoder0 = AutoEncoder.load_from_hf("gelu-2l_L0_16384_mlp_out_51", "mps")
+encoder1 = AutoEncoder.load_from_hf("gelu-2l_L1_16384_mlp_out_50", "mps")
 # %%
 data = load_dataset("NeelNanda/c4-10k", split="train")
 tokenized_data = utils.tokenize_and_concatenate(data, model.tokenizer, max_length=128)
@@ -198,7 +197,7 @@ histogram(virtual_weights.median(0).values, title="Median by end feature")
 histogram(virtual_weights.median(1).values, title="Median by start feature")
 # %%
 
-# START HERE!
+# START HERE! ====================
 
 example_tokens = tokenized_data[:600]["tokens"]
 _, cache = model.run_with_cache(example_tokens, stop_at_layer=2, names_filter=lambda x: "mlp_out" in x)
@@ -218,7 +217,7 @@ except:
 hidden_is_pos0 = hidden_acts0 > 0
 hidden_is_pos1 = hidden_acts1 > 0
 d_enc = hidden_acts0.shape[-1]
-cooccur_count = torch.zeros((d_enc, d_enc), device="cuda", dtype=torch.float32)
+cooccur_count = torch.zeros((d_enc, d_enc), device="mps", dtype=torch.float32)
 for end_i in tqdm.trange(d_enc):
     cooccur_count[:, end_i] = hidden_is_pos0[hidden_is_pos1[:, end_i]].float().sum(0)
 # %%
@@ -300,4 +299,123 @@ new_hidden_acts_on_an = hidden_acts_new[:, :, new_end_topk].reshape(-1, 5)[examp
 old_hidden_acts_on_an = hidden_acts1[:, new_end_topk][example_tokens[:, 1:].flatten()==model.to_single_token(" an"), :]
 for i in range(5):
     scatter(x=old_hidden_acts_on_an[:, i], y=new_hidden_acts_on_an[:, i], hover=np.arange(180), title=new_end_topk[i].item(), include_diag=True, yaxis="POst Ablation", xaxis="Pre Ablation")
+# %%
+
+# 28/11/2023 ====================
+
+def get_feature_acts(point, layer, sae, num_batches = 1000, minibatch_size = 50):
+  try:
+    del feature_acts
+    del random_feature_acts
+  except NameError:
+    pass
+
+  # get however many tokens we need
+  toks = tokenized_data["tokens"][:num_batches]
+  toks = toks.to("mps")
+
+  # get activations on test tokens at point of interest. Run model on batches of tokens with size [batch_size, 128]. Be careful with RAM.
+
+  for i in tqdm.tqdm(range(toks.size(0)//minibatch_size)):
+    # split toks into minibatch and run model with cache on minibatch
+    toks_batch = toks[minibatch_size*i : minibatch_size*(i+1), :]
+    logits, cache = model.run_with_cache(toks_batch, stop_at_layer=layer+1, names_filter=utils.get_act_name(point, layer))
+    del logits
+
+    act_batch = cache[point, layer]
+    act_batch = act_batch.detach().to('mps')
+    del cache
+
+    # get feature acts on this minibatch (fewer random ones to save RAM)
+    feature_act_batch = torch.relu(einops.einsum(act_batch - sae.b_dec, sae.W_enc, "batch seq resid , resid mlp -> batch seq mlp")  + sae.b_enc)
+
+    del act_batch
+
+    # append minibatch feature acts to storage variable
+    if i == 0:  # on first iteration, create feature_acts
+      feature_acts = feature_act_batch
+    else:  # then add to it
+      feature_acts = torch.cat([feature_acts, feature_act_batch], dim=0)
+
+    del feature_act_batch
+
+  # set BOS acts to zero
+  feature_acts[:, 0, :] = 0
+
+  # flatten [batch n_seq] dimensions
+  #feature_acts = feature_acts.reshape(-1, feature_acts.size(2))
+
+  print("feature_acts has size:", feature_acts.size())
+
+  return toks, feature_acts
+
+# %%
+
+toks, acts = get_feature_acts("mlp_out", 0, encoder0, num_batches=1024, minibatch_size=64)
+# %%
+
+# iterate through acts to get co occurring features
+
+def compute_cooccurrences(hidden_acts):
+    try:
+        hidden_acts = hidden_acts[:, 1:, :]
+        hidden_acts = einops.rearrange(hidden_acts, "batch pos d_enc -> (batch pos) d_enc")
+    except Exception as e:
+        print("FAILED:", e)
+        return None
+
+    hidden_is_pos = hidden_acts > 0
+    d_enc = hidden_acts.shape[-1]
+
+    cooccur_count = torch.zeros((d_enc, d_enc), device="cpu", dtype=torch.float32)
+    for end_i in tqdm.trange(d_enc):
+        cooccur_count[:, end_i] = hidden_is_pos[hidden_is_pos[:, end_i]].float().sum(0)
+
+    num_firings = hidden_is_pos.sum(0).to("cpu")
+    cooccur_freq = cooccur_count / torch.maximum(num_firings[:, None], num_firings[None, :])
+    cooccur_freq[cooccur_freq.isnan()] = 0.
+
+    cooccur_freq.fill_diagonal_(0.)
+
+    return cooccur_freq
+# %%
+
+# Usage example
+# hidden_acts is your input tensor
+cooccur_table = compute_cooccurrences(acts)
+print(cooccur_table)
+
+# %%
+print(cooccur_table.shape)
+# %%
+df = pd.DataFrame(cooccur_table.numpy())
+# %%
+# turn df into a long form dataframe
+df = df.stack().reset_index()
+
+# %%
+df[0].describe()
+# %%
+(cooccur_table.flatten()>.7).sum()
+# %%
+mean_acts = (acts > 0).float().mean(dim=(0,1))
+print(mean_acts.shape)
+# %%
+d_enc = mean_acts.shape[-1]
+df["mean_act_feature1"] = mean_acts.detach().cpu().repeat(d_enc)
+df["mean_act_feature2"] = mean_acts.detach().cpu().repeat(1, d_enc).flatten()
+# %%
+mean_acts.shape
+# %%
+df.head()
+# %%
+df_sparse = df[(df['mean_act_feature1'] < 1e-5) & (df['mean_act_feature2'] < 1e-5)]
+df_sparse.shape
+# %%
+df.shape
+# %%
+acts.shape
+
+# %%
+df_sparse[df_sparse[0] > 0].sort_values(0)
 # %%
